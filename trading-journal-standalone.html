@@ -1,0 +1,475 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>دفتر التداول</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Arabic:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+tailwind.config = { theme: { extend: {
+  colors: { ink:'#0d1013', surface:'#161a1f', raised:'#1e232a', border:'#2a3038', text:'#e7e5de', muted:'#8d93a0', faint:'#565c66', gain:'#4f9d6e', gainsoft:'#1c2a22', loss:'#be5a45', losssoft:'#2a201c', brass:'#c9a24b', brasssoft:'#2a2418' },
+  fontFamily: { sans:['IBM Plex Sans Arabic','sans-serif'], mono:['IBM Plex Mono','monospace'] }
+}}};
+</script>
+<style>
+  :root{color-scheme:dark}
+  body{background:#0d1013;font-family:'IBM Plex Sans Arabic',sans-serif;-webkit-font-smoothing:antialiased}
+  ::-webkit-scrollbar{width:8px;height:8px}
+  ::-webkit-scrollbar-thumb{background:#2a3038;border-radius:4px}
+  input,select,textarea{background:#0d1013;color:#e7e5de;font-family:inherit}
+  input:focus,select:focus,textarea:focus{outline:2px solid #c9a24b;outline-offset:1px}
+  table{font-variant-numeric:tabular-nums}
+  .ltr-field{direction:ltr;text-align:right}
+</style>
+</head>
+<body class="text-text">
+<div id="app" class="flex min-h-screen"><div class="p-8 text-faint text-sm">جارٍ التحميل…</div></div>
+<script>
+const $ = s => document.querySelector(s);
+let trades = [];
+let db = null, dbState = 'connecting';
+let view = 'dashboard';
+let calYear, calMonth;
+(function initCal() { const n = new Date(); calYear = n.getFullYear(); calMonth = n.getMonth(); })();
+let editingId = null;
+let saving = false;
+let toast = null;
+let confirmDeleteId = null;
+function showToast(text, type) {
+  toast = { text, type: type || 'error' };
+  render();
+  setTimeout(() => { if (toast && toast.text === text) { toast = null; render(); } }, 4500);
+}
+
+// ---------- calc engine ----------
+const isClosed = t => t.status === 'closed' && t.exitDate && (t.exitPrice != null || t.manualPnl != null);
+const netPnl = t => { if (t.manualPnl != null) return t.manualPnl; const d = t.direction === 'long' ? t.exitPrice - t.entryPrice : t.entryPrice - t.exitPrice; return d * t.quantity - (t.fees || 0); };
+const rMult = t => { if (t.stopLoss == null) return null; const r = Math.abs(t.entryPrice - t.stopLoss); if (!r) return null; return netPnl(t) / (r * t.quantity); };
+const money = n => (n < 0 ? '-' : '') + '$' + Math.abs(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const pnlSpan = n => `<span class="font-mono ltr-field inline-block ${n > 0 ? 'text-gain' : n < 0 ? 'text-loss' : 'text-muted'}">${n > 0 ? '+' : ''}${money(n)}</span>`;
+const dirLabel = d => d === 'long' ? 'طويل' : 'قصير';
+const statusLabel = s => s === 'open' ? 'مفتوحة' : 'مغلقة';
+
+function closedChrono(list) {
+  return list.filter(isClosed).sort((a, b) => new Date(a.exitDate) - new Date(b.exitDate));
+}
+function computeStats(list) {
+  const closed = closedChrono(list);
+  const pnls = closed.map(netPnl);
+  const wins = pnls.filter(p => p > 0), losses = pnls.filter(p => p < 0);
+  const gp = wins.reduce((a, b) => a + b, 0), gl = Math.abs(losses.reduce((a, b) => a + b, 0));
+  const total = pnls.reduce((a, b) => a + b, 0);
+  const rs = closed.map(rMult).filter(r => r != null);
+  let curW = 0, curL = 0, maxW = 0, maxL = 0;
+  for (const p of pnls) { if (p > 0) { curW++; curL = 0; maxW = Math.max(maxW, curW); } else if (p < 0) { curL++; curW = 0; maxL = Math.max(maxL, curL); } else { curW = 0; curL = 0; } }
+  return {
+    open: list.length - closed.length, closedN: closed.length,
+    wins: wins.length, losses: losses.length,
+    winRate: closed.length ? wins.length / closed.length * 100 : 0,
+    netPnl: total, pf: gl > 0 ? gp / gl : null,
+    expectancy: closed.length ? total / closed.length : 0,
+    avgWin: wins.length ? gp / wins.length : 0, avgLoss: losses.length ? gl / losses.length : 0,
+    avgR: rs.length ? rs.reduce((a, b) => a + b, 0) / rs.length : null,
+    winStreak: maxW, lossStreak: maxL,
+  };
+}
+
+// ---------- db ----------
+function makeLocalDb() {
+  const KEY = 'tj-trades';
+  const read = () => { try { return JSON.parse(localStorage.getItem(KEY) || '[]'); } catch (e) { return []; } };
+  const write = a => localStorage.setItem(KEY, JSON.stringify(a));
+  let listener = null;
+  const emit = () => listener && listener({ docs: read().map(t => ({ id: t.id, data: () => { const { id, ...r } = t; return r; } })) });
+  return {
+    collection: () => ({
+      onSnapshot: cb => { listener = cb; emit(); },
+      add: async data => { const a = read(); a.push({ ...data, id: 't' + Date.now() + Math.random().toString(36).slice(2, 6) }); write(a); emit(); }
+    }),
+    doc: path => { const id = path.split('/')[1]; return {
+      set: async data => { write(read().map(t => t.id === id ? { ...data, id } : t)); emit(); },
+      delete: async () => { write(read().filter(t => t.id !== id)); emit(); }
+    }; }
+  };
+}
+async function initDb() {
+  try {
+    db = (typeof claude === 'undefined' || !claude.use) ? makeLocalDb() : await claude.use('db');
+    if (!db) { dbState = 'unavailable'; render(); return; }
+    db.collection('trades').onSnapshot(
+      snap => { trades = snap.docs.map(d => ({ id: d.id, ...d.data() })); dbState = 'ready'; render(); },
+      () => { dbState = 'unavailable'; render(); }
+    );
+  } catch (e) { dbState = 'unavailable'; render(); }
+}
+initDb();
+
+async function saveTrade(data, id) {
+  if (!db) { showToast('تعذر الاتصال بقاعدة البيانات. أعد تحميل الصفحة وحاول مجددًا.'); return; }
+  saving = true; render();
+  try {
+    if (id) await db.doc('trades/' + id).set(data);
+    else await db.collection('trades').add(data);
+    saving = false; view = 'trades'; editingId = null; render();
+    showToast('تم حفظ الصفقة.', 'success');
+  } catch (err) {
+    saving = false; render();
+    showToast('تعذر حفظ الصفقة: ' + (err && err.message ? err.message : 'خطأ غير معروف'));
+  }
+}
+function askDelete(id) { confirmDeleteId = id; render(); }
+function cancelDelete() { confirmDeleteId = null; render(); }
+async function removeTrade(id) {
+  confirmDeleteId = null;
+  try { await db.doc('trades/' + id).delete(); showToast('تم حذف الصفقة.', 'success'); }
+  catch (err) { render(); showToast('تعذر حذف الصفقة: ' + (err && err.message ? err.message : 'خطأ غير معروف')); }
+}
+
+// ---------- shell ----------
+function setView(v, id) { view = v; editingId = id || null; render(); }
+
+function shell(content) {
+  return `
+  <aside class="hidden sm:flex w-56 shrink-0 flex-col border-l border-border bg-surface h-screen sticky top-0">
+    <div class="border-b border-border px-5 py-4">
+      <div class="font-mono ltr-field text-sm font-medium">journal<span class="text-brass">.</span></div>
+      <div class="mt-0.5 text-[11px] text-faint">دفتر تداول</div>
+    </div>
+    <nav class="flex-1 p-3 space-y-0.5">
+      ${navLink('dashboard', 'لوحة التحكم')}
+      ${navLink('trades', 'الصفقات')}
+    </nav>
+    <div class="border-t border-border p-3">
+      <button onclick="setView('form')" class="w-full rounded-sm bg-brass px-3 py-2 text-sm font-medium text-ink hover:bg-brass/90">+ تسجيل صفقة</button>
+    </div>
+  </aside>
+  <main class="min-w-0 flex-1">
+    <div class="sm:hidden flex items-center justify-between border-b border-border bg-surface px-4 py-3">
+      <div class="font-mono ltr-field text-sm">journal<span class="text-brass">.</span></div>
+      <div class="flex gap-3">
+        <button onclick="setView('dashboard')" class="text-xs ${view==='dashboard'?'text-brass':'text-muted'}">لوحة التحكم</button>
+        <button onclick="setView('trades')" class="text-xs ${view==='trades'?'text-brass':'text-muted'}">الصفقات</button>
+        <button onclick="setView('form')" class="text-xs text-brass">+ جديد</button>
+      </div>
+    </div>
+    ${content}
+  </main>`;
+}
+function navLink(v, label) {
+  const active = view === v;
+  return `<button onclick="setView('${v}')" class="w-full text-right flex items-center gap-2.5 rounded-sm px-3 py-2 text-sm ${active ? 'bg-raised text-text' : 'text-muted hover:bg-raised/60 hover:text-text'}">${label}</button>`;
+}
+function header(title, desc, actions) {
+  return `<div class="flex items-start justify-between gap-4 border-b border-border px-6 sm:px-8 py-6">
+    <div><h1 class="text-lg font-medium">${title}</h1>${desc ? `<p class="mt-1 text-sm text-muted">${desc}</p>` : ''}</div>
+    ${actions || ''}
+  </div>`;
+}
+
+// ---------- dashboard visuals ----------
+function ring(valueText, pct, color) {
+  const r = 28, c = 2 * Math.PI * r;
+  const dash = c * Math.min(Math.max(pct, 0), 100) / 100;
+  return `<div class="relative w-20 h-20 shrink-0 mx-auto">
+    <svg width="80" height="80" viewBox="0 0 80 80" style="direction:ltr">
+      <circle cx="40" cy="40" r="${r}" fill="none" stroke="#2a3038" stroke-width="7"/>
+      <circle cx="40" cy="40" r="${r}" fill="none" stroke="${color}" stroke-width="7" stroke-linecap="round" stroke-dasharray="${dash.toFixed(1)} ${(c - dash).toFixed(1)}" transform="rotate(-90 40 40)"/>
+    </svg>
+    <div class="absolute inset-0 flex items-center justify-center font-mono text-sm font-medium">${valueText}</div>
+  </div>`;
+}
+function statCard(label, value, tone, sub) {
+  const cls = tone === 'gain' ? 'text-gain' : tone === 'loss' ? 'text-loss' : 'text-text';
+  return `<div class="rounded-sm border border-border bg-surface p-4">
+    <div class="text-[11px] text-faint">${label}</div>
+    <div class="mt-1.5 font-mono ltr-field text-2xl font-medium ${cls}">${value}</div>
+    ${sub ? `<div class="mt-1 text-xs text-muted">${sub}</div>` : ''}
+  </div>`;
+}
+const AR_MONTHS = ['يناير', 'فبراير', 'مارس', 'أبريل', 'مايو', 'يونيو', 'يوليو', 'أغسطس', 'سبتمبر', 'أكتوبر', 'نوفمبر', 'ديسمبر'];
+const AR_DAYS = ['ح', 'ن', 'ث', 'ر', 'خ', 'ج', 'س'];
+function fmtDate(y, m, d) { return `${y}-${String(m + 1).padStart(2, '0')}-${String(d).padStart(2, '0')}`; }
+function dailyPnlMap(list) {
+  const map = {};
+  for (const t of list.filter(isClosed)) {
+    const k = t.exitDate;
+    if (!map[k]) map[k] = { pnl: 0, count: 0 };
+    map[k].pnl += netPnl(t); map[k].count += 1;
+  }
+  return map;
+}
+function calGrid(y, m) {
+  const startOffset = new Date(y, m, 1).getDay();
+  const daysInMonth = new Date(y, m + 1, 0).getDate();
+  const prevDaysInMonth = new Date(y, m, 0).getDate();
+  const cells = [];
+  for (let i = startOffset - 1; i >= 0; i--) cells.push({ y: m === 0 ? y - 1 : y, m: m === 0 ? 11 : m - 1, d: prevDaysInMonth - i, cur: false });
+  for (let d = 1; d <= daysInMonth; d++) cells.push({ y, m, d, cur: true });
+  while (cells.length % 7 !== 0) {
+    const last = cells[cells.length - 1], nd = new Date(last.y, last.m, last.d + 1);
+    cells.push({ y: nd.getFullYear(), m: nd.getMonth(), d: nd.getDate(), cur: false });
+  }
+  return cells;
+}
+function dayCell(c, map, todayKey) {
+  const key = fmtDate(c.y, c.m, c.d);
+  const info = map[key];
+  const isToday = key === todayKey;
+  const pnlColor = info ? (info.pnl > 0 ? 'text-gain' : info.pnl < 0 ? 'text-loss' : 'text-muted') : '';
+  return `<div class="rounded-sm border ${isToday ? 'border-brass' : 'border-border'} bg-surface p-1 sm:p-1.5 min-h-14 sm:min-h-16 ${c.cur ? '' : 'opacity-35'}">
+    <div class="text-[10px] sm:text-[11px] ${isToday ? 'text-brass font-medium' : 'text-faint'}">${c.d}</div>
+    ${info ? `<div class="mt-0.5 font-mono ltr-field text-[9px] sm:text-[11px] leading-tight ${pnlColor}">${(info.pnl >= 0 ? '+' : '') + money(info.pnl)}</div>
+    <div class="text-[9px] sm:text-[10px] text-faint">${info.count} صفقة</div>` : ''}
+  </div>`;
+}
+function weekTotalCell(week, map) {
+  let total = 0, hasAny = false;
+  for (const c of week) { const k = fmtDate(c.y, c.m, c.d); if (map[k]) { total += map[k].pnl; hasAny = true; } }
+  const cls = hasAny ? (total > 0 ? 'text-gain' : total < 0 ? 'text-loss' : 'text-muted') : 'text-faint';
+  return `<div class="rounded-sm bg-raised/60 p-1 sm:p-1.5 min-h-14 sm:min-h-16 flex flex-col items-center justify-center">
+    <div class="text-[9px] sm:text-[10px] text-faint">الأسبوع</div>
+    <div class="mt-0.5 font-mono ltr-field text-[10px] sm:text-xs font-medium ${cls}">${hasAny ? (total >= 0 ? '+' : '') + money(total) : '—'}</div>
+  </div>`;
+}
+function calNav(delta) { calMonth += delta; if (calMonth < 0) { calMonth = 11; calYear--; } else if (calMonth > 11) { calMonth = 0; calYear++; } render(); }
+function calToday() { const n = new Date(); calYear = n.getFullYear(); calMonth = n.getMonth(); render(); }
+function calendarCard() {
+  const map = dailyPnlMap(trades);
+  const cells = calGrid(calYear, calMonth);
+  const n = new Date(); const todayKey = fmtDate(n.getFullYear(), n.getMonth(), n.getDate());
+  const weeks = []; for (let i = 0; i < cells.length; i += 7) weeks.push(cells.slice(i, i + 7));
+  const rows = weeks.map(week => `<div class="grid grid-cols-8 gap-1">${week.map(c => dayCell(c, map, todayKey)).join('')}${weekTotalCell(week, map)}</div>`).join('<div class="h-1"></div>');
+  return `<div class="rounded-sm border border-border bg-surface p-4">
+    <div class="flex items-center justify-between mb-3">
+      <div class="text-sm font-medium text-muted">${AR_MONTHS[calMonth]} ${calYear}</div>
+      <div class="flex items-center gap-1">
+        <button onclick="calNav(-1)" class="w-7 h-7 rounded-sm border border-border hover:bg-raised text-sm">›</button>
+        <button onclick="calToday()" class="px-2 h-7 rounded-sm border border-border hover:bg-raised text-xs">اليوم</button>
+        <button onclick="calNav(1)" class="w-7 h-7 rounded-sm border border-border hover:bg-raised text-sm">‹</button>
+      </div>
+    </div>
+    <div class="grid grid-cols-8 gap-1 mb-1">
+      ${AR_DAYS.map(d => `<div class="text-center text-[10px] text-faint py-1">${d}</div>`).join('')}
+      <div class="text-center text-[10px] text-faint py-1">إجمالي</div>
+    </div>
+    <div class="space-y-1">${rows}</div>
+  </div>`;
+}
+function barsSvg(closed) {
+  if (!closed.length) return `<div class="h-48 flex items-center justify-center text-sm text-faint text-center px-4">لا توجد صفقات مغلقة بعد — سيظهر الرسم بعد تسجيل النتائج.</div>`;
+  const w = 760, h = 200, pad = 16, n = closed.length;
+  const gap = (w - pad * 2) / n, bw = Math.max(3, gap * 0.6);
+  const vals = closed.map(netPnl);
+  const maxAbs = Math.max(1, ...vals.map(v => Math.abs(v)));
+  const mid = h / 2;
+  const bars = vals.map((v, i) => {
+    const x = pad + i * gap + (gap - bw) / 2;
+    const bh = Math.abs(v) / maxAbs * (h / 2 - 12);
+    const y = v >= 0 ? mid - bh : mid;
+    const color = v >= 0 ? '#4f9d6e' : '#be5a45';
+    return `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${bw.toFixed(1)}" height="${bh.toFixed(1)}" fill="${color}" rx="1.5"/>`;
+  }).join('');
+  return `<svg viewBox="0 0 ${w} ${h}" class="w-full h-48" style="direction:ltr">
+    <line x1="${pad}" y1="${mid}" x2="${w - pad}" y2="${mid}" stroke="#2a3038"/>${bars}
+  </svg>`;
+}
+function renderDashboard() {
+  const s = computeStats(trades);
+  const closed = closedChrono(trades);
+  const recent = [...trades].sort((a, b) => (b.entryDate || '').localeCompare(a.entryDate || '')).slice(0, 8);
+  const pfPct = s.pf == null ? 0 : Math.min(100, s.pf / 5 * 100);
+  return shell(`
+    ${header('لوحة التحكم', 'أين تقف الأرقام، صفقة بصفقة.')}
+    <div class="p-6 sm:p-8 space-y-6">
+      <div class="rounded-sm border border-border bg-surface p-5 flex flex-wrap items-center gap-6 justify-between">
+        <div>
+          <div class="text-[11px] text-faint">صافي الربح/الخسارة</div>
+          <div class="mt-1.5 font-mono ltr-field text-3xl font-medium ${s.netPnl > 0 ? 'text-gain' : s.netPnl < 0 ? 'text-loss' : 'text-text'}">${(s.netPnl >= 0 ? '+' : '-') + money(Math.abs(s.netPnl))}</div>
+          <div class="mt-1 text-xs text-muted">${s.closedN} صفقة مغلقة من أصل ${trades.length}</div>
+        </div>
+        <div class="flex gap-8">
+          <div class="text-center">
+            ${ring(s.pf == null ? '—' : s.pf.toFixed(2), pfPct, '#c9a24b')}
+            <div class="mt-2 text-[11px] text-faint">عامل الربح</div>
+          </div>
+          <div class="text-center">
+            ${ring(s.winRate.toFixed(0) + '%', s.winRate, '#4f9d6e')}
+            <div class="mt-2 text-[11px] text-faint">معدل الفوز</div>
+          </div>
+        </div>
+      </div>
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+        ${statCard('التوقع', (s.expectancy >= 0 ? '+' : '-') + money(Math.abs(s.expectancy)), s.expectancy > 0 ? 'gain' : s.expectancy < 0 ? 'loss' : null, 'لكل صفقة')}
+        ${statCard('سلسلة فوز', String(s.winStreak), s.winStreak ? 'gain' : null, 'أطول تتابع')}
+        ${statCard('سلسلة خسارة', String(s.lossStreak), s.lossStreak ? 'loss' : null, 'أطول تتابع')}
+        ${statCard('متوسط R', s.avgR == null ? '—' : s.avgR.toFixed(2) + 'R', null, s.open + ' صفقة مفتوحة')}
+      </div>
+      ${calendarCard()}
+      <div class="rounded-sm border border-border bg-surface p-4">
+        <div class="text-sm font-medium text-muted mb-3">الأرباح والخسائر لكل صفقة</div>
+        ${barsSvg(closed)}
+      </div>
+      <div class="rounded-sm border border-border bg-surface">
+        <div class="flex items-center justify-between p-4">
+          <div class="text-sm font-medium text-muted">أحدث الصفقات</div>
+          <button onclick="setView('trades')" class="text-xs text-brass hover:underline">عرض الكل</button>
+        </div>
+        ${recent.length ? tradeTable(recent) : emptyState()}
+      </div>
+    </div>`);
+}
+
+// ---------- trades list ----------
+function badge(text, tone) {
+  const cls = tone === 'brass' ? 'border-brass/30 bg-brasssoft text-brass' : 'border-border bg-raised text-muted';
+  return `<span class="inline-flex items-center rounded-sm border ${cls} px-1.5 py-0.5 text-[11px] font-medium">${text}</span>`;
+}
+function emptyState() {
+  return `<div class="px-4 pb-6 text-sm text-faint">لا توجد صفقات مسجلة بعد. ابدأ بـ <button onclick="setView('form')" class="text-brass hover:underline">تسجيل صفقة</button>.</div>`;
+}
+function tradeTable(list) {
+  return `<div class="overflow-x-auto"><table class="w-full text-sm border-collapse">
+    <thead><tr class="border-b border-border text-[11px] text-faint">
+      <th class="text-right px-3 py-2">الرمز</th><th class="text-right px-3 py-2">الاتجاه</th>
+      <th class="text-right px-3 py-2">الدخول</th><th class="text-right px-3 py-2">الخروج</th>
+      <th class="text-left px-3 py-2">الربح/الخسارة</th><th class="text-right px-3 py-2">الحالة</th><th></th>
+    </tr></thead><tbody class="divide-y divide-border/60">
+      ${list.map(t => `<tr class="hover:bg-raised/60">
+        <td class="px-3 py-2.5"><button onclick="setView('form','${t.id}')" class="font-mono ltr-field inline-block font-medium hover:text-brass">${t.symbol}</button></td>
+        <td class="px-3 py-2.5 text-muted">${dirLabel(t.direction)}</td>
+        <td class="px-3 py-2.5 text-muted font-mono ltr-field">${t.entryDate}</td>
+        <td class="px-3 py-2.5 text-muted font-mono ltr-field">${t.exitDate || '—'}</td>
+        <td class="px-3 py-2.5 text-left">${isClosed(t) ? pnlSpan(netPnl(t)) + (t.manualPnl != null ? ' <span class="text-[9px] text-faint">يدوي</span>' : '') : '—'}</td>
+        <td class="px-3 py-2.5">${badge(statusLabel(t.status), t.status === 'open' ? 'brass' : null)}</td>
+        <td class="px-3 py-2.5 text-left whitespace-nowrap">${t.id === confirmDeleteId
+          ? `<button onclick="removeTrade('${t.id}')" class="text-loss text-xs font-medium">تأكيد؟</button>
+             <button onclick="cancelDelete()" class="text-faint hover:text-text text-xs mr-2">إلغاء</button>`
+          : `<button onclick="setView('form','${t.id}')" class="text-faint hover:text-brass text-xs">تعديل</button>
+             <button onclick="askDelete('${t.id}')" class="text-faint hover:text-loss text-xs mr-2">حذف</button>`}</td>
+      </tr>`).join('')}
+    </tbody></table></div>`;
+}
+function renderTrades() {
+  const q = ($('#tj-search') && $('#tj-search').value || '').toUpperCase();
+  const list = [...trades].filter(t => !q || t.symbol.includes(q)).sort((a, b) => (b.entryDate || '').localeCompare(a.entryDate || ''));
+  return shell(`
+    ${header('الصفقات', trades.length + ' صفقة مسجلة', `<button onclick="setView('form')" class="rounded-sm bg-brass px-3 py-1.5 text-sm font-medium text-ink hover:bg-brass/90">تسجيل صفقة</button>`)}
+    <div class="p-6 sm:p-8">
+      <input id="tj-search" oninput="render()" placeholder="تصفية حسب الرمز…" value="${q}" class="ltr-field mb-4 h-9 w-full max-w-xs rounded-sm border border-border px-3 text-sm placeholder:text-faint">
+      <div class="rounded-sm border border-border bg-surface">${list.length ? tradeTable(list) : emptyState()}</div>
+    </div>`);
+}
+
+// ---------- form ----------
+function field(label, inner) { return `<div class="space-y-1.5"><label class="text-xs font-medium text-muted">${label}</label>${inner}</div>`; }
+function formatNumInput(val) {
+  if (val == null) return '';
+  let s = String(val).replace(/,/g, '').trim();
+  if (s === '' || s === '-' || s === '.') return s;
+  const neg = s.startsWith('-'); if (neg) s = s.slice(1);
+  let [ip, dp] = s.split('.');
+  ip = ip.replace(/[^\d]/g, '') || '0';
+  ip = ip.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  return (neg ? '-' : '') + ip + (dp !== undefined ? '.' + dp.replace(/[^\d]/g, '') : '');
+}
+const inp = (id, attrs = '', val = '', extraClass = '') => `<input id="${id}" value="${val ?? ''}" ${attrs} class="flex h-9 w-full rounded-sm border border-border px-3 py-1 text-sm placeholder:text-faint ${extraClass}">`;
+function renderForm() {
+  const t = editingId ? trades.find(x => x.id === editingId) : null;
+  const today = new Date().toISOString().slice(0, 10);
+  const status = t ? t.status : 'closed';
+  const hasManual = !!t && t.manualPnl != null;
+  return shell(`
+    ${header(t ? 'تعديل الصفقة' : 'تسجيل صفقة', t ? t.symbol : 'سجّل صفقة دخول، أو صفقة مكتملة إذا كانت مغلقة بالفعل.')}
+    <div class="max-w-3xl p-6 sm:p-8">
+      <form onsubmit="return submitForm(event)" novalidate class="space-y-5">
+        <div class="grid grid-cols-2 sm:grid-cols-4 gap-4">
+          ${field('الرمز', inp('f-symbol', '', t ? t.symbol : '', 'font-mono ltr-field uppercase'))}
+          ${field('الاتجاه', `<select id="f-direction" class="flex h-9 w-full rounded-sm border border-border px-3 py-1 text-sm"><option value="long" ${t && t.direction === 'long' ? 'selected' : ''}>طويل</option><option value="short" ${t && t.direction === 'short' ? 'selected' : ''}>قصير</option></select>`)}
+          ${field('الحالة', `<select id="f-status" onchange="toggleExit()" class="flex h-9 w-full rounded-sm border border-border px-3 py-1 text-sm"><option value="closed" ${status === 'closed' ? 'selected' : ''}>مغلقة</option><option value="open" ${status === 'open' ? 'selected' : ''}>مفتوحة</option></select>`)}
+          ${field('الاستراتيجية', inp('f-strategy', 'placeholder="اختراق"', t ? t.strategy : ''))}
+        </div>
+        <div class="grid grid-cols-2 sm:grid-cols-4 gap-4">
+          ${field('تاريخ الدخول', inp('f-entryDate', 'type="date"', t ? t.entryDate : today, 'ltr-field'))}
+          ${field('سعر الدخول', inp('f-entryPrice', 'type="number" step="any" min="0"', t ? t.entryPrice : '', 'ltr-field font-mono'))}
+          ${field('الكمية', inp('f-quantity', 'type="number" step="any" min="0"', t ? t.quantity : '', 'ltr-field font-mono'))}
+          ${field('العمولات', inp('f-fees', 'type="number" step="any" min="0"', t ? t.fees : 0, 'ltr-field font-mono'))}
+        </div>
+        <div class="grid grid-cols-2 sm:grid-cols-4 gap-4">
+          ${field('تاريخ الخروج', inp('f-exitDate', 'type="date" id="f-exitDate"', t ? t.exitDate : '', 'ltr-field'))}
+          ${field('سعر الخروج', inp('f-exitPrice', 'type="number" step="any" min="0" id="f-exitPrice"', t ? t.exitPrice : '', 'ltr-field font-mono'))}
+          ${field('وقف الخسارة', inp('f-stopLoss', 'type="text" inputmode="decimal" onblur="this.value=formatNumInput(this.value)"', formatNumInput(t ? t.stopLoss : ''), 'ltr-field font-mono'))}
+          ${field('جني الأرباح', inp('f-takeProfit', 'type="text" inputmode="decimal" onblur="this.value=formatNumInput(this.value)"', formatNumInput(t ? t.takeProfit : ''), 'ltr-field font-mono'))}
+        </div>
+        <div class="grid grid-cols-2 sm:grid-cols-4 gap-4">
+          ${field('الربح/الخسارة (يدوي)', `<select id="f-manualType" onchange="toggleManual()" class="flex h-9 w-full rounded-sm border border-border px-3 py-1 text-sm"><option value="auto" ${!hasManual ? 'selected' : ''}>تلقائي</option><option value="win" ${hasManual && t.manualPnl >= 0 ? 'selected' : ''}>ربح</option><option value="loss" ${hasManual && t.manualPnl < 0 ? 'selected' : ''}>خسارة</option></select>`)}
+          ${field('المبلغ ($)', inp('f-manualAmt', 'type="text" inputmode="decimal" onblur="this.value=formatNumInput(this.value)"', formatNumInput(hasManual ? Math.abs(t.manualPnl) : ''), 'ltr-field font-mono'))}
+        </div>
+        <p class="text-[11px] text-faint -mt-2">اختر ربح أو خسارة واكتب المبلغ لتُعتمد كصافي نتيجة الصفقة بدل الحساب من الأسعار (ولا يلزم حينها سعر الخروج). اتركه «تلقائي» للحساب العادي.</p>
+        ${field('الوسوم (مفصولة بفواصل)', inp('f-tags', 'placeholder="أرباح، فجوة صعودية"', t ? t.tags : ''))}
+        ${field('ملاحظات', `<textarea id="f-notes" rows="4" class="flex w-full rounded-sm border border-border px-3 py-2 text-sm placeholder:text-faint" placeholder="الإعداد، الفرضية، ما نجح وما لم ينجح…">${t && t.notes ? t.notes : ''}</textarea>`)}
+        <div class="flex items-center gap-3 border-t border-border pt-5">
+          <button type="submit" ${saving ? 'disabled' : ''} class="rounded-sm bg-brass px-4 py-2 text-sm font-medium text-ink hover:bg-brass/90 disabled:opacity-50">${saving ? 'جارٍ الحفظ…' : (t ? 'حفظ التغييرات' : 'تسجيل الصفقة')}</button>
+          <button type="button" onclick="setView('trades')" class="text-sm text-muted hover:text-text">إلغاء</button>
+        </div>
+      </form>
+    </div>`);
+}
+function toggleExit() {
+  const open = $('#f-status').value === 'open';
+  $('#f-exitDate').disabled = open; $('#f-exitPrice').disabled = open;
+}
+function toggleManual() { const el = $('#f-manualType'); if (el) $('#f-manualAmt').disabled = el.value === 'auto'; }
+function submitForm(e) {
+  e.preventDefault();
+  if (saving) return false;
+  const v = id => $('#' + id).value.trim();
+  const status = v('f-status');
+  const num = s => { const c = s.replace(/,/g, ''); return c === '' ? null : parseFloat(c); };
+  const mt = v('f-manualType'), ma = num(v('f-manualAmt'));
+  const data = {
+    symbol: v('f-symbol').toUpperCase(), direction: v('f-direction'), status,
+    strategy: v('f-strategy') || null,
+    entryDate: v('f-entryDate'), exitDate: status === 'closed' ? (v('f-exitDate') || null) : null,
+    entryPrice: num(v('f-entryPrice')), exitPrice: status === 'closed' ? num(v('f-exitPrice')) : null,
+    quantity: num(v('f-quantity')), stopLoss: num(v('f-stopLoss')), takeProfit: num(v('f-takeProfit')),
+    fees: num(v('f-fees')) || 0, tags: v('f-tags') || null, notes: v('f-notes') || null,
+    manualPnl: (status === 'closed' && mt !== 'auto' && ma != null && !isNaN(ma)) ? (mt === 'loss' ? -Math.abs(ma) : Math.abs(ma)) : null,
+    createdAt: new Date().toISOString(),
+  };
+  const missing = [];
+  if (!data.symbol) missing.push('الرمز');
+  if (!data.entryDate) missing.push('تاريخ الدخول');
+  if (data.entryPrice == null || isNaN(data.entryPrice)) missing.push('سعر الدخول');
+  if (data.quantity == null || isNaN(data.quantity)) missing.push('الكمية');
+  if (status === 'closed') {
+    if (!data.exitDate) missing.push('تاريخ الخروج');
+    if (mt !== 'auto' && (ma == null || isNaN(ma))) missing.push('مبلغ الربح/الخسارة');
+    else if (data.manualPnl == null && (data.exitPrice == null || isNaN(data.exitPrice))) missing.push('سعر الخروج (أو الربح/الخسارة اليدوي)');
+  }
+  if (missing.length) { showToast('الحقول التالية مطلوبة: ' + missing.join('، ')); return false; }
+  saveTrade(data, editingId);
+  return false;
+}
+
+// ---------- root render ----------
+function toastBanner() {
+  if (!toast) return '';
+  const tone = toast.type === 'success' ? 'border-gain/30 bg-gainsoft text-gain' : 'border-loss/30 bg-losssoft text-loss';
+  return `<div class="fixed top-3 inset-x-3 sm:inset-x-auto sm:left-3 sm:max-w-sm z-50 rounded-sm border ${tone} px-4 py-2.5 text-sm flex items-center justify-between gap-3">
+    <span>${toast.text}</span>
+    <button onclick="toast=null;render()" class="opacity-70 hover:opacity-100">✕</button>
+  </div>`;
+}
+function render() {
+  if (dbState === 'connecting') { $('#app').innerHTML = `<div class="p-8 text-faint text-sm">جارٍ الاتصال…</div>`; return; }
+  if (dbState === 'unavailable') { $('#app').innerHTML = `<div class="p-8 max-w-md text-sm text-muted">تحتاج هذه الصفحة إلى ميزة قاعدة البيانات لحفظ الصفقات، وهي غير متاحة في هذا العرض.</div>`; return; }
+  const html = view === 'trades' ? renderTrades() : view === 'form' ? renderForm() : renderDashboard();
+  $('#app').innerHTML = toastBanner() + html;
+  if (view === 'form') setTimeout(() => { toggleExit(); toggleManual(); }, 0);
+}
+</script>
+</body>
+</html>
